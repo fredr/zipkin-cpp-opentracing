@@ -8,18 +8,13 @@
 namespace ot = opentracing;
 
 namespace zipkin {
-#define PREFIX_TRACER_STATE "x-b3-"
 // Note: these constants are a convention of the OpenTracing basictracers.
 const ot::string_view prefix_baggage = "ot-baggage-";
 
 const int tracer_state_required_field_count = 2;
-const ot::string_view zipkin_trace_id = PREFIX_TRACER_STATE "traceid";
-const ot::string_view zipkin_span_id = PREFIX_TRACER_STATE "spanid";
-const ot::string_view zipkin_parent_span_id =
-    PREFIX_TRACER_STATE "parentspanid";
-const ot::string_view zipkin_sampled = PREFIX_TRACER_STATE "sampled";
-const ot::string_view zipkin_flags = PREFIX_TRACER_STATE "flags";
-#undef PREFIX_TRACER_STATE
+const int trace_id_hex_length = 32;
+
+const ot::string_view gcp_trace_ctx = "x-cloud-trace-context";
 
 static bool keyCompare(ot::string_view lhs, ot::string_view rhs) {
   return lhs.length() == rhs.length() &&
@@ -45,6 +40,30 @@ static bool parseBool(ot::string_view s, bool &result) {
   return false;
 }
 
+static bool parseGCPHeader(ot::string_view value, std::vector<std::string> &parts) {
+  auto value_str = std::string{value};
+
+  auto split = StringUtil::split(value_str, "/");
+  if (split.size() != 2) {
+    return false;
+  }
+  parts.insert(parts.end(), split[0]);
+
+  split = StringUtil::split(split[1], ";");
+  if (split.size() != 2) {
+    return false;
+  }
+  parts.insert(parts.end(), split[0]);
+
+  split = StringUtil::split(split[1], "=");
+  if (split.size() != 2) {
+    return false;
+  }
+  parts.insert(parts.end(), split[1]);
+
+  return true;
+}
+
 opentracing::expected<void>
 injectSpanContext(std::ostream &carrier,
                   const zipkin::SpanContext &span_context,
@@ -56,30 +75,22 @@ opentracing::expected<void>
 injectSpanContext(const opentracing::TextMapWriter &carrier,
                   const zipkin::SpanContext &span_context,
                   const std::unordered_map<std::string, std::string> &baggage) {
-  auto result = carrier.Set(zipkin_trace_id, span_context.traceIdAsHexString());
+  auto trace_id_hex = span_context.traceIdAsHexString();
+  if (trace_id_hex.size() < trace_id_hex_length) {
+    trace_id_hex = (std::string(trace_id_hex_length-trace_id_hex.size(), '0') + trace_id_hex);
+  }
+
+  auto value = trace_id_hex
+    + "/"
+    + std::to_string(span_context.id())
+    + ";o="
+    + (span_context.isSampled() ? "1" : "0");
+
+  auto result = carrier.Set(gcp_trace_ctx, value);
   if (!result) {
     return result;
   }
-  result = carrier.Set(zipkin_span_id, span_context.idAsHexString());
-  if (!result) {
-    return result;
-  }
-  result = carrier.Set(zipkin_sampled, span_context.isSampled() ? "1" : "0");
-  if (!result) {
-    return result;
-  }
-  if (span_context.isSetParentId()) {
-    result =
-        carrier.Set(zipkin_parent_span_id, span_context.parentIdAsHexString());
-    if (!result) {
-      return result;
-    }
-  }
-  result = carrier.Set(zipkin_flags,
-                       std::to_string(span_context.flags() & debug_flag));
-  if (!result) {
-    return result;
-  }
+
   std::string baggage_key = prefix_baggage;
   for (const auto &baggage_item : baggage) {
     baggage_key.replace(std::begin(baggage_key) + prefix_baggage.size(),
@@ -108,40 +119,30 @@ extractSpanContext(const opentracing::TextMapReader &carrier,
   flags_t flags = 0;
   auto result = carrier.ForeachKey(
       [&](ot::string_view key, ot::string_view value) -> ot::expected<void> {
-        if (keyCompare(key, zipkin_trace_id)) {
-          auto trace_id_maybe = Hex::hexToTraceId(value);
+        if (keyCompare(key, gcp_trace_ctx)) {
+          std::vector<std::string> parts;
+          if (!parseGCPHeader(value, parts)) {
+            return ot::make_unexpected(ot::span_context_corrupted_error);
+          }
+
+          auto trace_id_maybe = Hex::hexToTraceId(parts[0]);
           if (!trace_id_maybe.valid()) {
             return ot::make_unexpected(ot::span_context_corrupted_error);
           }
           trace_id = trace_id_maybe.value();
           ++required_field_count;
-        } else if (keyCompare(key, zipkin_span_id)) {
-          auto span_id_maybe = Hex::hexToUint64(value);
-          if (!span_id_maybe.valid()) {
+
+          if (!StringUtil::atoull(parts[1].c_str(), span_id)) {
             return ot::make_unexpected(ot::span_context_corrupted_error);
           }
-          span_id = span_id_maybe.value();
           ++required_field_count;
-        } else if (keyCompare(key, zipkin_flags)) {
-          auto value_str = std::string{value};
-          flags_t f;
-          if (!StringUtil::atoull(value_str.c_str(), f)) {
-            return ot::make_unexpected(ot::span_context_corrupted_error);
-          }
-          // Only use the debug flag.
-          flags |= f & debug_flag;
-        } else if (keyCompare(key, zipkin_sampled)) {
+
           bool sampled;
-          if (!parseBool(value, sampled)) {
+          if (!parseBool(parts[2], sampled)) {
             return ot::make_unexpected(ot::span_context_corrupted_error);
           }
           if (sampled) {
             flags |= sampled_flag;
-          }
-        } else if (keyCompare(key, zipkin_parent_span_id)) {
-          parent_id = Hex::hexToTraceId(value);
-          if (!parent_id.valid()) {
-            return ot::make_unexpected(ot::span_context_corrupted_error);
           }
         } else if (key.length() > prefix_baggage.size() &&
                    keyCompare(
